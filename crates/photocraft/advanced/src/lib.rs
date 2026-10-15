@@ -66,7 +66,8 @@ const MANIFEST: &str = concat!(
     "amount":         {"type": "number", "min": 0, "max": 100, "default": 50}
   },
   "overlap": 1,
-  "area": "content"
+  "area": "content",
+  "stage": "source"
 }"#
 );
 
@@ -138,7 +139,10 @@ fn filter(mut band: Band) -> i32 {
     let picked = band.colour_param(["filmBaseRed", "filmBaseGreen", "filmBaseBlue"]);
     let measured = band.measurement().and_then(|m| {
         let m = match picked {
-            Some(base) => Measurement { base, black: base, ..m },
+            Some(base) => {
+                let base = m.reencode(band.enc, base);
+                Measurement { base, black: base, ..m }
+            }
             None => m,
         };
         Some((m.analysis(band.enc)?, m.balance))

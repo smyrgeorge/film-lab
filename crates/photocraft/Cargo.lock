@@ -30,6 +30,7 @@ name = "film-lab-photocraft"
 version = "0.1.0"
 dependencies = [
  "film-lab-core",
+ "libm",
 ]
 
 [[package]]

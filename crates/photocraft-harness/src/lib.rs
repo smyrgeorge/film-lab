@@ -118,6 +118,8 @@ pub const MODE_CMYK: u32 = 4;
 
 /// `pc_filter(buf, buf_len, width, height, channels, format, params, params_len) -> i32`.
 type FilterFn = TypedFunc<(i32, i32, i32, i32, i32, i32, i32, i32), i32>;
+/// `pc_analyze(…same arguments…) -> i64` (ABI v1.1 proposal).
+type AnalyzeFn = TypedFunc<(i32, i32, i32, i32, i32, i32, i32, i32), i64>;
 
 /// PhotoCraft's instruction budget: this much per call …
 pub const FUEL_BASE: u64 = 50_000_000;
@@ -132,6 +134,7 @@ pub struct Host {
     manifest: TypedFunc<(), i64>,
     alloc: TypedFunc<i32, i32>,
     filter: FilterFn,
+    instance: Instance,
     fuel_used: u64,
 }
 
@@ -155,7 +158,7 @@ impl Host {
         let manifest = instance.get_typed_func(&store, "pc_manifest").map_err(|e| format!("pc_manifest: {e}"))?;
         let alloc = instance.get_typed_func(&store, "pc_alloc").map_err(|e| format!("pc_alloc: {e}"))?;
         let filter = instance.get_typed_func(&store, "pc_filter").map_err(|e| format!("pc_filter: {e}"))?;
-        let mut host = Self { store, memory, abi_version, manifest, alloc, filter, fuel_used: 0 };
+        let mut host = Self { store, memory, abi_version, manifest, alloc, filter, instance, fuel_used: 0 };
         host.refuel(FUEL_BASE)?;
         Ok(host)
     }
@@ -218,5 +221,31 @@ impl Host {
             *v = f32::from_le_bytes(*b);
         }
         Ok(code)
+    }
+
+    /// Runs the optional `pc_analyze` export (ABI v1.1 proposal) on `pixels`: the JSON text it
+    /// returned, `None` for 0 (nothing measured), or an error when the module lacks the export.
+    pub fn analyze(&mut self, pixels: &[f32], width: u32, height: u32, channels: u32, format: u32, params: &str) -> Result<Option<String>, String> {
+        let f: AnalyzeFn = self.instance.get_typed_func(&self.store, "pc_analyze").map_err(|e| format!("pc_analyze: {e}"))?;
+        self.refuel(FUEL_BASE + FUEL_PER_SAMPLE * pixels.len() as u64)?;
+        let bytes: Vec<u8> = pixels.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let buf = self.alloc(bytes.len().max(1))?;
+        self.memory.write(&mut self.store, buf, &bytes).map_err(|e| format!("write pixels: {e}"))?;
+        let pbuf = self.alloc(params.len().max(1))?;
+        self.memory.write(&mut self.store, pbuf, params.as_bytes()).map_err(|e| format!("write params: {e}"))?;
+        let arg = |v: usize| i32::try_from(v).map_err(|_| "argument too large".to_string());
+        let packed = f
+            .call(
+                &mut self.store,
+                (arg(buf)?, arg(bytes.len())?, width as i32, height as i32, channels as i32, format as i32, arg(pbuf)?, arg(params.len())?),
+            )
+            .map_err(|e| format!("pc_analyze trapped: {e}"))? as u64;
+        if packed == 0 {
+            return Ok(None);
+        }
+        let (len, ptr) = ((packed >> 32) as usize, (packed & 0xffff_ffff) as usize);
+        let mut text = vec![0u8; len];
+        self.memory.read(&self.store, ptr, &mut text).map_err(|e| format!("analysis out of range: {e}"))?;
+        String::from_utf8(text).map(Some).map_err(|e| format!("analysis is not UTF-8: {e}"))
     }
 }

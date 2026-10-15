@@ -51,7 +51,8 @@ const MANIFEST: &str = concat!(
     "saturation": {"type": "number", "min": -50, "max": 50, "default": 0}
   },
   "overlap": 0,
-  "area": "content"
+  "area": "content",
+  "stage": "source"
 }"#
 );
 

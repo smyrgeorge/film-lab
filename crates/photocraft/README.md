@@ -178,3 +178,10 @@ linear documents, every preset and slider, the neutral sample). `tests/advanced.
 the advanced plug-in at its defaults matches Convert Negative, that a picked base neutralises a
 wrong mask and wins over the measured one, and its tone, colour and sharpening controls. The
 `synthetic_negative` example writes a negative to run through `photocraft-cli` by hand.
+
+## `pc_analyze` (ABI v1.1 proposal)
+
+Both modules also export `pc_analyze`, which runs the companion's measurement on a whole frame a
+host hands over and returns it as JSON; a host passes it back to `pc_filter` as `_analysis`,
+which wins over the embedded measurement. PhotoCraft doesn't call it, so nothing changes there.
+See `PROPOSAL-pc-analyze.md`.
