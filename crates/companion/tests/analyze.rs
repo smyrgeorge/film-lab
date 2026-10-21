@@ -105,6 +105,49 @@ fn the_companion_and_the_harness_name_the_same_modules() {
     }
 }
 
+/// A colour negative (each channel its own scene ramp, so the neutral balance has work to do)
+/// with a film border, 8-bit sRGB.
+fn coloured(w: u32, h: u32, border: u32) -> DynamicImage {
+    let white = libm::exp2f(RANGE_STOPS) - 1.0;
+    let img = ImageBuffer::from_fn(w, h, |x, y| {
+        let inside = x >= border && y >= border && x < w - border && y < h - border;
+        let t = if inside { ((x - border) + (y - border) * w) as f32 / (w * h) as f32 } else { 0.0 };
+        let mut px = [0u8; 3];
+        for ch in 0..3 {
+            let s = (t * [1.0, 0.7, 0.4][ch]).min(1.0);
+            px[ch] = (color::srgb_encode(film::transmittance(1.0 + s * white, BASE[ch])) * 255.0).round() as u8;
+        }
+        Rgb(px)
+    });
+    DynamicImage::ImageRgb8(img)
+}
+
+#[test]
+fn pc_analyze_measures_what_the_companion_measures() {
+    use film_lab_photocraft_harness::{Host, MODE_RGB, Plugin as Built, build_plugin, format_code};
+    let img = coloured(300, 200, 12);
+    let levels = analyze(&img, &AnalyzeOptions::default()).unwrap();
+    assert!(levels.balance.iter().any(|b| (b - 1.0).abs() > 0.01), "the frame needs a balance: {levels:?}");
+    let px: Vec<f32> = img.to_rgb8().pixels().flat_map(|p| p.0.map(|v| f32::from(v) / 255.0)).collect();
+    for built in Built::ALL {
+        let mut host = Host::load(&std::fs::read(build_plugin(built).unwrap()).unwrap()).unwrap();
+        let text = host.analyze(&px, 300, 200, 3, format_code(8, false, MODE_RGB), "{}").unwrap().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let near = |key: &str, ours: [f32; 3], tol: f64| {
+            for (ch, v) in ours.iter().enumerate() {
+                let theirs = json[key][ch].as_f64().unwrap();
+                assert!((theirs - f64::from(*v)).abs() <= tol, "{built:?} {key}[{ch}]: pc_analyze {theirs}, companion {v}");
+            }
+        };
+        // pc_analyze rounds levels to tenths and the balance to thousandths, as the block does.
+        near("base", levels.base, 0.051);
+        near("black", levels.black, 0.051);
+        near("white", levels.white, 0.051);
+        near("balance", levels.balance, 0.00051);
+        assert_eq!(json["samples"], levels.samples, "{built:?}");
+    }
+}
+
 #[test]
 fn converts_through_photocraft_cli_when_available() {
     let Some(cli) = std::env::var_os("PHOTOCRAFT_CLI") else {

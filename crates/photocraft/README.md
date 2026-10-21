@@ -18,7 +18,7 @@ only builds for `wasm32-unknown-unknown`, and `.cargo/config.toml` makes that th
 here. The modules share one version (`[workspace.package]`), which every manifest reports.
 
 ```text
-abi/        film-lab-photocraft: the four exports (`plugin!`), the band, the measurement block,
+abi/        film-lab-photocraft: the exports (`plugin!`), the band, the measurement block,
             the conversion loop and sharpening, shared by every plug-in
 convert/    film-lab-convert → film_lab_convert.wasm: its manifest and its parameters
 advanced/   film-lab-convert-advanced → film_lab_convert_advanced.wasm: the same, with every control
@@ -180,3 +180,52 @@ linear documents, every preset and slider, the neutral sample). `tests/advanced.
 the advanced plug-in at its defaults matches Convert Negative, that a picked base neutralises a
 wrong mask and wins over the measured one, and its tone, colour and sharpening controls. The
 `synthetic_negative` example writes a negative to run through `photocraft-cli` by hand.
+
+## `pc_analyze` (ABI v1.1 proposal)
+
+For hosts that can hand a plug-in the whole frame. PhotoCraft never calls it and never sends
+`_analysis`, so nothing changes there: the companion's measurement block works as before.
+
+**The export.** Both modules export, next to the four ABI v1 exports:
+
+```text
+pc_analyze(buf, len, width, height, channels, format, params, params_len) -> i64
+```
+
+The arguments are `pc_filter`'s (a buffer from `pc_alloc` holding the whole frame, or a
+downsampled copy of it, and the parameter JSON); the buffer is only read. It returns
+`len << 32 | ptr`: the UTF-8 JSON object at `ptr` in the module's memory, `len` bytes long,
+valid until the next call into the instance. It returns 0 when there is nothing to measure (a
+flat or tiny frame, an alpha-only or CMYK band).
+
+It runs the companion's measurement with the companion's default options
+(`film_lab_core::MeasureOptions::DEFAULT`, the same code `film-lab analyze` runs): an 8 % border
+left out, the base at the 0.1 % clip, black and white at 0.3 %, the Neutral balance, at most
+1 M samples. Samples are read in the band's `encoding` (`linear`, or `srgb`) and measured as
+sRGB, so the result is on the companion's scale whatever the host's encoding.
+
+**The result**, the `_analysis` object:
+
+```json
+{"filmlab":1,"scale":"srgb255","base":[r,g,b],"black":[r,g,b],"white":[r,g,b],"balance":[r,g,b],"samples":n}
+```
+
+- `filmlab`: the format's version, 1.
+- `scale`: `"srgb255"`, sRGB-encoded scan values on 0..255 (tenths), as the Info panel shows them.
+- `base`, `black`, `white`: the film base and each channel's black and white points.
+- `balance`: the per-channel mid-tone gammas of the Neutral balance (thousandths; optional, 1 =
+  none).
+- `samples`: the pixels measured (informative).
+
+**Passing it back.** A host stores the object with the edit and passes it on every `pc_filter`
+call as the top-level `_analysis` member of the params JSON. It wins over the measurement block,
+which wins over the preset's film base; a typed or picked film base still wins over the measured
+base. `_analysis` is read with a nesting- and escape-aware scan of the params JSON, so the order
+of members, whitespace and extra members (of any type) don't matter. When it isn't a JSON
+object, has another `filmlab` or `scale`, or lacks a `base`, `black` or `white` of three finite
+numbers, it is ignored, and the plug-in runs as it would without it. A grey document takes each
+triple's first channel, from `_analysis` and from the block alike.
+
+**The stage hint.** Both manifests carry `"stage": "source"`: a hint for hosts with a develop
+pipeline that the filter wants the scan's samples before other adjustments. PhotoCraft's manifest
+parser ignores unknown keys.

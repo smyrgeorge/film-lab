@@ -14,9 +14,19 @@
 //! so nothing measured from one band agrees with the next. The companion measures the whole scan
 //! and writes the result into the module before installing it ([`MEASUREMENT_MARKER`]); every
 //! plug-in reads it with [`Band::measurement`].
+//!
+//! # `pc_analyze` (ABI v1.1 proposal)
+//!
+//! A host with a whole-image pass (LightCraft Classic's pixel filters) calls the optional
+//! `pc_analyze(buf, len, w, h, channels, format, params, params_len) -> i64` once on a whole,
+//! downsampled frame and passes the JSON object it returns (`len << 32 | ptr`, 0 = nothing) back
+//! to every `pc_filter` call as `_analysis`. [`analyze`] runs the companion's measurement there
+//! ([`film_lab_core::measure`], the code `film-lab analyze` runs too); [`Band::measurement`]
+//! prefers `_analysis` over the block, so PhotoCraft (which never calls it) behaves as before.
+//! The README's `pc_analyze` section is the contract: the signature, the packing and the JSON.
 #![no_std]
 
-use film_lab_core::{Analysis, Converter, Encoding, Params, Sharpen, Tables, params, sharpen};
+use film_lab_core::{Analysis, Converter, Encoding, MeasureOptions, Params, Sharpen, Tables, ValueHistogram, params, sharpen};
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -66,6 +76,29 @@ macro_rules! plugin {
             match unsafe { $crate::Band::new(buf, len, width, height, channels, format, params, params_len) } {
                 Ok(band) => $filter(band),
                 Err(code) => code,
+            }
+        }
+
+        /// ABI v1.1 proposal: measures the whole frame once; returns `len << 32 | ptr` of a JSON
+        /// object for the host to pass back to `pc_filter` as `_analysis`, or 0 for nothing.
+        ///
+        /// # Safety
+        /// As `pc_filter`'s; the buffer is only read.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn pc_analyze(
+            buf: *mut f32,
+            len: u32,
+            width: u32,
+            height: u32,
+            channels: u32,
+            format: u32,
+            params: *const u8,
+            params_len: u32,
+        ) -> i64 {
+            // SAFETY: the host's contract above is `Band::new`'s.
+            match unsafe { $crate::Band::new(buf, len, width, height, channels, format, params, params_len) } {
+                Ok(band) => $crate::analyze(&band),
+                Err(_) => 0,
             }
         }
     };
@@ -130,20 +163,255 @@ fn colour(json: &[u8], keys: [&str; 3], grey: bool) -> Option<[f32; 3]> {
 }
 
 /// The companion's measurement as the block holds it: scan values in the host encoding (0..1)
-/// and the per-channel balance.
+/// and the per-channel balance. One from `_analysis` holds sRGB-encoded scan values whatever the
+/// band's encoding (`encoding` is then `Some(Srgb)`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Measurement {
     pub base: [f32; 3],
     pub black: [f32; 3],
     pub white: [f32; 3],
     pub balance: [f32; 3],
+    /// The encoding the scan values are in; `None`: the band's.
+    pub encoding: Option<Encoding>,
 }
 
 impl Measurement {
-    /// The levels these scan values give, or `None` when a channel has no range.
-    pub fn analysis(&self, enc: Encoding) -> Option<Analysis> {
-        Analysis::from_scan_values(self.base, self.black, self.white, enc)
+    /// The measurement for a grey document, whichever source it came from: every triple (levels
+    /// and balance) takes its first channel, as a grey document's colour parameters take their
+    /// first key ([`Band::colour_param`]). Measurements of grey frames have equal channels anyway.
+    pub fn grey(self) -> Self {
+        let first = |v: [f32; 3]| [v[0]; 3];
+        Self { base: first(self.base), black: first(self.black), white: first(self.white), balance: first(self.balance), ..self }
     }
+
+    /// The levels these scan values give, or `None` when a channel has no range. `enc` is the
+    /// band's encoding, used unless the measurement names its own.
+    pub fn analysis(&self, enc: Encoding) -> Option<Analysis> {
+        Analysis::from_scan_values(self.base, self.black, self.white, self.encoding.unwrap_or(enc))
+    }
+
+    /// A scan value in the band's encoding `enc` (0..1) re-encoded the way this measurement's
+    /// values are (an Eyedropper pick to merge with an `_analysis` measurement).
+    pub fn reencode(&self, enc: Encoding, v: [f32; 3]) -> [f32; 3] {
+        match self.encoding {
+            Some(m) if m != enc => m.encode3([enc.decode(v[0]), enc.decode(v[1]), enc.decode(v[2])]),
+            _ => v,
+        }
+    }
+}
+
+/// The histogram (12 KiB) and the JSON `pc_analyze` returns live here: no allocator, and too
+/// much for the stack.
+static mut HISTOGRAM: ValueHistogram = ValueHistogram::new();
+static mut ANALYSIS_OUT: [u8; 256] = [0; 256];
+
+/// JSON written into a fixed byte buffer by hand: `core::fmt`'s float formatting alone would add
+/// some 20 KB to each module. `ok` turns false once something didn't fit.
+struct Out<'a> {
+    buf: &'a mut [u8],
+    at: usize,
+    ok: bool,
+}
+
+impl Out<'_> {
+    fn bytes(&mut self, b: &[u8]) {
+        match self.at.checked_add(b.len()).and_then(|end| Some((end, self.buf.get_mut(self.at..end)?))) {
+            Some((end, dst)) => {
+                dst.copy_from_slice(b);
+                self.at = end;
+            }
+            None => self.ok = false,
+        }
+    }
+
+    fn uint(&mut self, mut v: u32) {
+        let mut digits = [0u8; 10];
+        let mut i = digits.len();
+        loop {
+            i -= 1;
+            if let Some(d) = digits.get_mut(i) {
+                *d = b'0' + (v % 10) as u8;
+            }
+            v /= 10;
+            if v == 0 || i == 0 {
+                break;
+            }
+        }
+        self.bytes(digits.get(i..).unwrap_or(&[]));
+    }
+
+    /// A non-negative value rounded to `places` (1..=3) decimals; negative or NaN is written as 0.
+    fn fixed(&mut self, v: f32, places: u32) {
+        let scale = 10u32.pow(places);
+        let n = (v * scale as f32 + 0.5) as u32; // saturating: NaN and negatives give 0
+        self.uint(n / scale);
+        self.bytes(b".");
+        let frac = n % scale;
+        let mut div = scale / 10;
+        while div > 0 {
+            self.bytes(&[b'0' + (frac / div % 10) as u8]);
+            div /= 10;
+        }
+    }
+
+    fn triple(&mut self, key: &[u8], v: [f32; 3], places: u32) {
+        self.bytes(b",\"");
+        self.bytes(key);
+        self.bytes(b"\":[");
+        for (i, x) in v.into_iter().enumerate() {
+            if i > 0 {
+                self.bytes(b",");
+            }
+            self.fixed(x, places);
+        }
+        self.bytes(b"]");
+    }
+}
+
+/// `pc_analyze`: the companion's whole-scan measurement ([`film_lab_core::measure`] with
+/// [`MeasureOptions::DEFAULT`], the companion's default options) on the frame `band` holds. The
+/// values are sRGB-encoded scan values on the 0..255 scale whatever the input encoding, the way
+/// the companion reports them. Returns `len << 32 | ptr` of the JSON, or 0 when there is nothing
+/// to measure.
+pub fn analyze(band: &Band) -> i64 {
+    // SAFETY: a wasm instance runs one call at a time, and nothing else reaches the histogram.
+    let hist = unsafe { &mut *core::ptr::addr_of_mut!(HISTOGRAM) };
+    let (w, n, enc, grey, alpha) = (band.width, band.channels, band.enc, band.grey(), band.alpha);
+    let px: &[f32] = band.px;
+    let pixel = |x: usize, y: usize| {
+        let at = y.checked_mul(w)?.checked_add(x)?.checked_mul(n)?;
+        let pix = px.get(at..at.checked_add(n)?)?;
+        if !Band::opaque(alpha, n, pix) {
+            return None;
+        }
+        let c0 = *pix.first()?;
+        let rgb = if grey { [c0; 3] } else { [c0, *pix.get(1)?, *pix.get(2)?] };
+        Some(if enc == Encoding::Srgb { rgb } else { Encoding::Srgb.encode3([enc.decode(rgb[0]), enc.decode(rgb[1]), enc.decode(rgb[2])]) })
+    };
+    let Ok(m) = film_lab_core::measure(band.width, band.height, &MeasureOptions::DEFAULT, hist, pixel) else { return 0 };
+
+    // SAFETY: as the histogram's.
+    let buf = unsafe { &mut *core::ptr::addr_of_mut!(ANALYSIS_OUT) };
+    let mut out = Out { buf, at: 0, ok: true };
+    out.bytes(br#"{"filmlab":1,"scale":"srgb255""#);
+    out.triple(b"base", m.base, 1);
+    out.triple(b"black", m.black, 1);
+    out.triple(b"white", m.white, 1);
+    out.triple(b"balance", m.balance, 3);
+    out.bytes(br#","samples":"#);
+    out.uint(m.samples);
+    out.bytes(b"}");
+    if !out.ok {
+        return 0;
+    }
+    ((out.at as i64) << 32) | (out.buf.as_ptr() as usize as i64)
+}
+
+/// A JSON reader just big enough for `_analysis`, nesting- and escape-aware: no allocator, so no
+/// JSON library. Anything it can't read is `None`, and the plug-in falls back as without one.
+mod json {
+    fn skip_ws(s: &[u8]) -> &[u8] {
+        s.get(s.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(s.len())..).unwrap_or(&[])
+    }
+
+    /// The length of the string `s` starts with (quotes included; `\"` and `\\` honoured).
+    fn string_len(s: &[u8]) -> Option<usize> {
+        let mut i = 1usize;
+        loop {
+            match s.get(i)? {
+                b'\\' => i = i.checked_add(2)?,
+                b'"' => return i.checked_add(1),
+                _ => i = i.checked_add(1)?,
+            }
+        }
+    }
+
+    /// The length of the value `s` starts with: a string, an object or array (strings and nesting
+    /// inside it honoured), or a scalar up to the next delimiter.
+    fn value_len(s: &[u8]) -> Option<usize> {
+        match s.first()? {
+            b'"' => string_len(s),
+            b'{' | b'[' => {
+                let (mut depth, mut i) = (0usize, 0usize);
+                while let Some(b) = s.get(i) {
+                    match b {
+                        b'"' => {
+                            i = i.checked_add(string_len(s.get(i..)?)?)?;
+                            continue;
+                        }
+                        b'{' | b'[' => depth = depth.checked_add(1)?,
+                        b'}' | b']' => {
+                            depth = depth.checked_sub(1)?;
+                            if depth == 0 {
+                                return i.checked_add(1);
+                            }
+                        }
+                        _ => {}
+                    }
+                    i = i.checked_add(1)?;
+                }
+                None
+            }
+            _ => Some(s.iter().position(|b| matches!(b, b',' | b'}' | b']') || b.is_ascii_whitespace()).unwrap_or(s.len())),
+        }
+    }
+
+    /// The value of the top-level member `key` of the object `obj` (nested objects and strings are
+    /// skipped whole, so a key inside them never matches).
+    pub fn member<'a>(obj: &'a [u8], key: &str) -> Option<&'a [u8]> {
+        let mut s = skip_ws(obj).strip_prefix(b"{")?;
+        loop {
+            s = skip_ws(s);
+            if s.first() == Some(&b'}') {
+                return None;
+            }
+            let klen = string_len(s).filter(|_| s.first() == Some(&b'"'))?;
+            let k = s.get(1..klen - 1)?;
+            s = skip_ws(s.get(klen..)?).strip_prefix(b":")?;
+            s = skip_ws(s);
+            let vlen = value_len(s)?;
+            if k == key.as_bytes() {
+                return s.get(..vlen);
+            }
+            s = skip_ws(s.get(vlen..)?);
+            s = s.strip_prefix(b",").unwrap_or(s);
+        }
+    }
+
+    /// The number under `key` in `obj`, if it is one and finite.
+    pub fn number(obj: &[u8], key: &str) -> Option<f32> {
+        core::str::from_utf8(member(obj, key)?).ok()?.parse::<f32>().ok().filter(|v| v.is_finite())
+    }
+
+    /// The three finite numbers of the array under `key` in `obj` (`[r, g, b]`).
+    pub fn triple(obj: &[u8], key: &str) -> Option<[f32; 3]> {
+        let a = member(obj, key)?;
+        let inner = core::str::from_utf8(a.strip_prefix(b"[")?.strip_suffix(b"]")?).ok()?;
+        let mut v = [0.0f32; 3];
+        let mut it = inner.split(',');
+        for x in v.iter_mut() {
+            *x = it.next()?.trim().parse::<f32>().ok().filter(|f| f.is_finite())?;
+        }
+        if it.next().is_some() { None } else { Some(v) }
+    }
+}
+
+/// A measurement from the host's `_analysis` (the object [`analyze`] returned), if `params` has
+/// one: `filmlab` 1, `scale` `"srgb255"`, and `base`, `black`, `white` (and optionally `balance`)
+/// as `[r, g, b]`. Other members are ignored.
+fn host_measurement(params: &[u8]) -> Option<Measurement> {
+    let a = json::member(params, "_analysis")?;
+    if json::number(a, "filmlab")? != 1.0 || json::member(a, "scale")? != br#""srgb255""# {
+        return None;
+    }
+    let s = |v: [f32; 3]| [v[0] / 255.0, v[1] / 255.0, v[2] / 255.0];
+    Some(Measurement {
+        base: s(json::triple(a, "base")?),
+        black: s(json::triple(a, "black")?),
+        white: s(json::triple(a, "white")?),
+        balance: json::triple(a, "balance").unwrap_or([1.0; 3]),
+        encoding: Some(Encoding::Srgb),
+    })
 }
 
 /// One band of the layer, as the host hands it to `pc_filter`.
@@ -218,16 +486,18 @@ impl Band<'_> {
         table.iter().find(|(text, _)| *text == v).map(|(_, t)| *t)
     }
 
-    /// The companion's measurement, when the module holds one.
+    /// The whole-image measurement: the host's `_analysis` ([`analyze`]'s result) when the
+    /// parameters carry one, else the companion's, when the module holds one.
     pub fn measurement(&self) -> Option<Measurement> {
-        let b = measurement_block();
-        let grey = self.grey();
-        let base = colour(b, ["base_r", "base_g", "base_b"], grey)?;
-        let black = colour(b, ["black_r", "black_g", "black_b"], grey).unwrap_or(base);
-        let white = colour(b, ["white_r", "white_g", "white_b"], grey)?;
-        let bal = |k: &str| params::number(b, k).unwrap_or(1.0);
-        let balance = if grey { [bal("balance_r"); 3] } else { [bal("balance_r"), bal("balance_g"), bal("balance_b")] };
-        Some(Measurement { base, black, white, balance })
+        let m = host_measurement(self.json).or_else(|| {
+            let b = measurement_block();
+            let base = colour(b, ["base_r", "base_g", "base_b"], false)?;
+            let black = colour(b, ["black_r", "black_g", "black_b"], false).unwrap_or(base);
+            let white = colour(b, ["white_r", "white_g", "white_b"], false)?;
+            let bal = |k: &str| params::number(b, k).unwrap_or(1.0);
+            Some(Measurement { base, black, white, balance: [bal("balance_r"), bal("balance_g"), bal("balance_b")], encoding: None })
+        })?;
+        Some(if self.grey() { m.grey() } else { m })
     }
 
     /// Levels from a film base alone (scan values in the document's encoding), for a scan of the

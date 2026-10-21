@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 pub mod app;
 pub mod compare;
 
-use film_lab_core::{Analysis, Converter, Encoding, Params, Tone, ValueHistogram, color};
+use film_lab_core::{MeasureOptions, ValueHistogram};
 use image::DynamicImage;
 use serde_json::{Map, Value, json};
 
@@ -65,8 +65,32 @@ pub struct AnalyzeOptions {
 }
 
 impl Default for AnalyzeOptions {
+    /// [`MeasureOptions::DEFAULT`], which `pc_analyze` uses too.
     fn default() -> Self {
-        Self { border_percent: 8.0, base_clip: 0.1, black_clip: 0.3, white_clip: 0.3, wb: WbMode::Neutral, max_samples: 1_000_000 }
+        let m = MeasureOptions::DEFAULT;
+        Self {
+            border_percent: m.border_percent,
+            base_clip: m.base_clip,
+            black_clip: m.black_clip,
+            white_clip: m.white_clip,
+            wb: if m.neutral { WbMode::Neutral } else { WbMode::Auto },
+            max_samples: m.max_samples,
+        }
+    }
+}
+
+impl AnalyzeOptions {
+    /// The measurement these options ask for; the white-balance offset of Warm and Cool goes on
+    /// top ([`Levels::plugin_params`]).
+    pub fn measure_options(&self) -> MeasureOptions {
+        MeasureOptions {
+            border_percent: self.border_percent,
+            base_clip: self.base_clip,
+            black_clip: self.black_clip,
+            white_clip: self.white_clip,
+            neutral: self.wb == WbMode::Neutral,
+            max_samples: self.max_samples,
+        }
     }
 }
 
@@ -182,62 +206,17 @@ fn round1(x: f32) -> f64 {
     (f64::from(x) * 10.0).round() / 10.0
 }
 
-/// Analyses `img` as a negative (any colour type; 16-bit stays 16-bit until it is normalised).
+/// Analyses `img` as a negative (any colour type; 16-bit stays 16-bit until it is normalised),
+/// with [`film_lab_core::measure`]: the same measurement the plug-ins' `pc_analyze` makes.
 pub fn analyze(img: &DynamicImage, o: &AnalyzeOptions) -> Result<Levels, String> {
     let rgb = img.to_rgb32f();
-    let (w, h) = (rgb.width() as usize, rgb.height() as usize);
-    let border = (o.border_percent.clamp(0.0, 45.0) / 100.0) as f64;
-    let (x0, x1) = ((w as f64 * border) as usize, w - (w as f64 * border) as usize);
-    let (y0, y1) = ((h as f64 * border) as usize, h - (h as f64 * border) as usize);
-    if x1 <= x0 || y1 <= y0 {
-        return Err("the border leaves no pixels to analyse".into());
-    }
-    let area = (x1 - x0) * (y1 - y0);
-    let step = ((area as f64 / o.max_samples.max(1) as f64).sqrt().ceil() as usize).max(1);
     let mut hist = ValueHistogram::new();
-    for y in (y0..y1).step_by(step) {
-        for x in (x0..x1).step_by(step) {
-            let p = rgb.get_pixel(x as u32, y as u32).0;
-            hist.push([p[0], p[1], p[2]]);
-        }
-    }
-    if hist.count() == 0 {
-        return Err("no pixels to analyse".into());
-    }
-    let q = |ch: usize, frac: f32| hist.quantile(ch, frac).map(|v| v * 255.0).ok_or_else(|| "empty histogram".to_string());
-    let mut levels = Levels { base: [0.0; 3], black: [0.0; 3], white: [0.0; 3], temp: o.wb.temp(), balance: [1.0; 3], samples: hist.count() };
-    let mut median = [0.0; 3];
-    for (ch, m) in median.iter_mut().enumerate() {
-        levels.base[ch] = q(ch, 1.0 - (o.base_clip / 100.0).clamp(0.0, 0.5))?;
-        levels.black[ch] = q(ch, 1.0 - (o.black_clip / 100.0).clamp(0.0, 0.5))?;
-        levels.white[ch] = q(ch, (o.white_clip / 100.0).clamp(0.0, 0.5))?;
-        *m = q(ch, 0.5)?;
-        if levels.white[ch] >= levels.black[ch] {
-            return Err(format!("channel {ch} has no tonal range between black and white (a flat scan, or the border buffer is too small)"));
-        }
-    }
-    if o.wb == WbMode::Neutral {
-        levels.balance = neutral_balance(&levels, median);
-    }
-    Ok(levels)
-}
-
-/// Per-channel gammas that bring each channel's median positive to the geometric mean of the
-/// three: the scene averages grey, black and white stay put. Scans are 8- or 16-bit sRGB.
-fn neutral_balance(levels: &Levels, median_scan: [f32; 3]) -> [f32; 3] {
-    let enc = Encoding::Srgb;
-    let scale = |v: [f32; 3]| [v[0] / 255.0, v[1] / 255.0, v[2] / 255.0];
-    let Some(a) = Analysis::from_scan_values(scale(levels.base), scale(levels.black), scale(levels.white), enc) else { return [1.0; 3] };
-    let c = Converter::new(&a, &Params { tone: Tone::Linear, ..Params::default() }, enc, None);
-    let out = c.convert(scale(median_scan));
-    let m =
-        [color::srgb_decode(out[0]).clamp(1e-3, 0.999), color::srgb_decode(out[1]).clamp(1e-3, 0.999), color::srgb_decode(out[2]).clamp(1e-3, 0.999)];
-    let target = (m[0].ln() + m[1].ln() + m[2].ln()) / 3.0;
-    let mut balance = [1.0; 3];
-    for (b, v) in balance.iter_mut().zip(m) {
-        *b = (target / v.ln()).clamp(0.4, 2.5);
-    }
-    balance
+    let m = film_lab_core::measure(rgb.width() as usize, rgb.height() as usize, &o.measure_options(), &mut hist, |x, y| {
+        let p = rgb.get_pixel_checked(u32::try_from(x).ok()?, u32::try_from(y).ok()?)?.0;
+        Some([p[0], p[1], p[2]])
+    })
+    .map_err(|e| e.to_string())?;
+    Ok(Levels { base: m.base, black: m.black, white: m.white, temp: o.wb.temp(), balance: m.balance, samples: m.samples })
 }
 
 /// The average colour of the `size × size` square centred on (`x`, `y`), on the 0..255 scale the
