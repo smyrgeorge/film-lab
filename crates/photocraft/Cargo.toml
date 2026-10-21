@@ -8,7 +8,7 @@ members = ["abi", "convert", "advanced"]
 
 # One version for every module: the release tag matches it, and each manifest reports it.
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT"

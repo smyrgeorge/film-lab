@@ -82,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "film-lab-companion"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "film-lab-core",
  "film-lab-photocraft-harness",
@@ -93,14 +93,14 @@ dependencies = [
 
 [[package]]
 name = "film-lab-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "libm",
 ]
 
 [[package]]
 name = "film-lab-photocraft-harness"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "film-lab-core",
  "libm",
